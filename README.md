@@ -1,1 +1,1 @@
-# WB_homework
+# WBTECH homework. Python and EDA.
