@@ -1,0 +1,161 @@
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"sync"
+)
+
+func main() {
+	runtime.GOMAXPROCS(1)
+	wg := sync.WaitGroup{}
+	wg.Add(7)
+	for i := 0; i < 9; i++ {
+		i := i
+		go func(i int) {
+			defer wg.Done()
+			fmt.Println("                           Почему, КОЛЯ?", i)
+		}(i)
+	}
+	wg.Wait()
+
+	// time.Sleep(1 * time.Second)
+	fmt.Println("Паника")
+}
+
+Почему, когда я выставляю runtime.GOMAXPROCS(4), то порядок выполнения может быть любым:
+
+                           Почему, КОЛЯ? 3
+                           Почему, КОЛЯ? 0
+                           Почему, КОЛЯ? 8
+                           Почему, КОЛЯ? 4
+                           Почему, КОЛЯ? 2
+                           Почему, КОЛЯ? 5
+                           Почему, КОЛЯ? 6
+Паника
+
+А если выставляю runtime.GOMAXPROCS(1)
+То всегда будет начинаться:
+
+Почему, КОЛЯ? 8
+
+______________________________________________________________________________________________
+
+Для начала разберемся с `runtime.GOMAXPROCS`. GOMAXPROCS устанавливает максимальное количество доступных CPU (по умолчанию - `runtime.NumCPU`, количество 
+процессорных ядер нашего компьютера). Т.е., при GOMAXPROCS(4) планировщик может выполнять несколько горутин одновременно на разных потоках. 
+
+На лекции была представлена модель G-M-P. Есть количество ядер нашего компьютера - CPU, и именно `GOMAXPROCS` задает количество задействованных ядер. У 
+каждого ядра есть Machine Thread (машина, М). В каждой машине работает процессор Р - планировщик Go. У каждого из планировщиков есть своя локальная очередь
+из горутин - G. 
+
+Начнем со 2 случая: количество логических процессоров - 1.
+
+Изучим, как горутина добавляется на выполнение (go func(i int)). В приложенном скрине (task2Screen) видно, что все горутины стоят на паузе, тогда как 
+последняя добавленая встала на выполнение (присвоился определенный Thread). Из докуметации посмотрим, как горутина добавляется на выполнение:
+
+// Create a new g running fn.
+// Put it on the queue of g's waiting to run.
+// The compiler turns a go statement into a call to this.
+func newproc(fn *funcval) {
+	gp := getg()
+	pc := sys.GetCallerPC()
+	systemstack(func() {
+		newg := newproc1(fn, gp, pc, false, waitReasonZero)
+
+		pp := getg().m.p.ptr()
+		runqput(pp, newg, true)
+
+		if mainStarted {
+			wakep()
+		}
+	})
+}
+
+Видим, что `newproc1` создает новую горутину и потом она добавляется в очередь выполнения:
+
+runqput(pp, newg, true)
+
+Новая горутина `newg` добавляется в локальную очередь процессора `pp`. На что указывает `true`? Как работает `runqput`:
+
+// runqput tries to put g on the local runnable queue.
+// If next is false, runqput adds g to the tail of the runnable queue.
+// If next is true, runqput puts g in the pp.runnext slot.
+// If the run queue is full, runnext puts g on the global queue.
+// Executed only by the owner P.
+func runqput(pp *p, gp *g, next bool) {
+	if !haveSysmon && next {
+		// A runnext goroutine shares the same time slice as the
+		// current goroutine (inheritTime from runqget). To prevent a
+		// ping-pong pair of goroutines from starving all others, we
+		// depend on sysmon to preempt "long-running goroutines". That
+		// is, any set of goroutines sharing the same time slice.
+		//
+		// If there is no sysmon, we must avoid runnext entirely or
+		// risk starvation.
+		next = false
+	}
+	if randomizeScheduler && next && randn(2) == 0 {
+		next = false
+	}
+
+	if next {
+	retryNext:
+		oldnext := pp.runnext
+		if !pp.runnext.cas(oldnext, guintptr(unsafe.Pointer(gp))) {
+			goto retryNext
+		}
+		if oldnext == 0 {
+			return
+		}
+		// Kick the old runnext out to the regular run queue.
+		gp = oldnext.ptr()
+	}
+	retry:
+	h := atomic.LoadAcq(&pp.runqhead) // load-acquire, synchronize with consumers
+	t := pp.runqtail
+	if t-h < uint32(len(pp.runq)) {
+		pp.runq[t%uint32(len(pp.runq))].set(gp)
+		atomic.StoreRel(&pp.runqtail, t+1) // store-release, makes the item available for consumption
+		return
+	}
+	if runqputslow(pp, gp, h, t) {
+		return
+	}
+	// the queue is not full, now the put above must succeed
+	goto retry
+}
+
+Аргумет `next` определяет, должна ли горутина добавиться следующей для выполнения. Если да, то она добавляется в поле `runnext` процессора. Если `runnext` 
+пуст, новая горутина помещается туда. Если занят, старая горутина вытесняется обратно в очередь. 
+
+Если `next` не установлен или `runnext` заполнен, то горутина добавляется в обычную очередь.
+
+При вызове `newproc` функция `runqput` содержит аргумент `true`. Комментарий из кода:
+
+// If next is true, runqput puts g in the pp.runnext slot.
+
+Докуметация по `runnext`:
+
+	// runnext, if non-nil, is a runnable G that was ready'd by
+	// the current G and should be run next instead of what's in
+	// runq if there's time remaining in the running G's time
+	// slice. It will inherit the time left in the current time
+	// slice. If a set of goroutines is locked in a
+	// communicate-and-wait pattern, this schedules that set as a
+	// unit and eliminates the (potentially large) scheduling
+	// latency that otherwise arises from adding the ready'd
+	// goroutines to the end of the run queue.
+	//
+	// Note that while other P's may atomically CAS this to zero,
+	// only the owner P can CAS it to a valid G.
+	runnext guintptr
+
+Поле `runnext` используется для хранения "приоритетной" горутины, которая должна быть выполнена следующей. Если `runnext` не равен nil, то выполняется 
+именно эта горутина, которая должна быть выполнена сразу после текущей. После ее выполнения он смотрит на локальную очередь или вовсе в глобальную.
+
+При `runtime.GOMAXPROCS(1)` горутина, добавленная в очередь последней, попадает в `runnext` и выполняется первой. Это является ответом на вопрос, почему 
+вывод всегда будет начинаться с "Почему, КОЛЯ? 8".
+
+При `runtime.GOMAXPROCS(4)` планировщик Go распределяет горутины между четырьмя процессорами P, каждый из которых работает независимо и выполняет горутины
+в своей локальной очереди в произвольном порядке. Даже если `runnext`используется для некоторых горутин, остальные попадают в локальные очереди `runq` или 
+глобальную очередь, что тоже влияет на непредсказуемость вывода.
