@@ -141,4 +141,4 @@ SHOPS.xslx
 
 Столбцы в результирующей таблице:
 
- `year`, `month`, `day`, `userid`, `ts` , `devicetype`, `deviceid` , `query`, `next_query`, `is_final`
+ `year`, `month`, `day`, `userid`, `ts` , `devicetype`, `deviceid` , `query`, `next_query`, `is_final`.
